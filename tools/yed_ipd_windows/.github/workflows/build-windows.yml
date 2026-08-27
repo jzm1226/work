@@ -1,0 +1,44 @@
+name: Build YED Windows Tool
+
+  on:
+    workflow_dispatch:
+
+  permissions:
+    contents: read
+
+  jobs:
+    build:
+      runs-on: windows-latest
+
+      steps:
+        - name: Checkout source
+          uses: actions/checkout@v4
+
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: "3.13"
+            cache: pip
+            cache-dependency-path: tools/yed_ipd_windows/requirements-build.txt
+
+        - name: Install dependencies
+          working-directory: tools/yed_ipd_windows
+          run: |
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements-build.txt
+
+        - name: Run tests
+          working-directory: tools/yed_ipd_windows
+          run: python -m unittest -v
+
+        - name: Build Windows EXE
+          working-directory: tools/yed_ipd_windows
+          run: |
+            python -m PyInstaller --noconfirm --clean --onefile --windowed --name YED_IPD_Test yed_ipd_tool.py
+
+        - name: Upload EXE
+          uses: actions/upload-artifact@v4
+          with:
+            name: YED_IPD_Test_Windows
+            path: tools/yed_ipd_windows/dist/YED_IPD_Test.exe
+            retention-days: 7
