@@ -24,7 +24,7 @@ from protocol import AtStreamParser, IpdFrame, StreamEvent
 
 
 APP_NAME = "YED IPD TCP Server Test"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 SOFTAP_IP = "192.168.4.1"
 SOFTAP_MASK = "255.255.255.0"
 SERVER_PORT = 4000
@@ -60,6 +60,8 @@ class LinkStats:
     duplicate_frames: int = 0
     bytes_received: int = 0
     ack_ok: int = 0
+    ack_command_retries: int = 0
+    ack_response_lost: int = 0
     echoed_frames: int = 0
     echoed_bytes: int = 0
     send_fail: int = 0
@@ -297,8 +299,7 @@ class TestRunner:
 
     def _echo_frame(self, frame: IpdFrame) -> None:
         link = self.stats.links[frame.link_id]
-        self._command(f"AT+IPDACK={frame.frame_id}", timeout=2.0, display=False)
-        link.ack_ok += 1
+        self._ack_frame(frame)
 
         self._write_command(
             f"AT+CIPSEND={frame.link_id},{len(frame.payload)}", display=False
@@ -327,6 +328,60 @@ class TestRunner:
         while len(self.processed_order) > 8192:
             old_id = self.processed_order.popleft()
             self.processed_ids.discard(old_id)
+
+    def _ack_frame(self, frame: IpdFrame) -> None:
+        link = self.stats.links[frame.link_id]
+        command = f"AT+IPDACK={frame.frame_id}"
+        first_response: Optional[bytes]
+
+        self._write_command(command, display=False)
+        try:
+            first_response = self._wait_for(
+                "ok", 0.75, fail_on_error=False
+            )
+        except TestFailure:
+            first_response = None
+
+        if first_response == b"OK":
+            link.ack_ok += 1
+            return
+
+        link.ack_command_retries += 1
+        reason = (
+            "timeout" if first_response is None
+            else first_response.decode("ascii", "replace")
+        )
+        self._emit_log(
+            f"ACK response {reason}, retrying link={frame.link_id} "
+            f"frame={frame.frame_id}"
+        )
+        time.sleep(0.1)
+        self._write_command(command, display=False)
+        try:
+            second_response = self._wait_for(
+                "ok", 2.0, fail_on_error=False
+            )
+        except TestFailure as exc:
+            raise TestFailure(
+                f"ACK retry timeout link={frame.link_id} "
+                f"frame={frame.frame_id}"
+            ) from exc
+
+        if second_response == b"OK":
+            link.ack_ok += 1
+            return
+        if first_response is None and second_response == b"ERROR":
+            # The first ACK was accepted but its OK was not observed.
+            link.ack_ok += 1
+            link.ack_response_lost += 1
+            self._emit_log(
+                f"ACK was accepted but response was lost link={frame.link_id} "
+                f"frame={frame.frame_id}"
+            )
+            return
+        raise TestFailure(
+            f"ACK rejected twice link={frame.link_id} frame={frame.frame_id}"
+        )
 
     def _setup_logs(self) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -508,6 +563,14 @@ class TestRunner:
                 anomalies.append(f"link{link_id} CRC errors={link.crc_errors}")
             if link.send_fail:
                 anomalies.append(f"link{link_id} SEND FAIL={link.send_fail}")
+            if link.ack_command_retries:
+                anomalies.append(
+                    f"link{link_id} ACK command retries={link.ack_command_retries}"
+                )
+            if link.ack_response_lost:
+                anomalies.append(
+                    f"link{link_id} ACK responses lost={link.ack_response_lost}"
+                )
         if anomalies:
             self.stats.result = "FAIL"
             self.stats.failure_reason = "; ".join(anomalies)
@@ -539,7 +602,9 @@ class TestRunner:
             lines.append(
                 f"LINK{link_id}: frames={link.frames} unique={link.unique_frames} "
                 f"duplicates={link.duplicate_frames} bytes_rx={link.bytes_received} "
-                f"ack_ok={link.ack_ok} echoed={link.echoed_frames} "
+                f"ack_ok={link.ack_ok} ack_retries={link.ack_command_retries} "
+                f"ack_response_lost={link.ack_response_lost} "
+                f"echoed={link.echoed_frames} "
                 f"bytes_echoed={link.echoed_bytes} send_fail={link.send_fail} "
                 f"crc_errors={link.crc_errors} max_gap={link.max_gap_seconds:.3f}s"
             )

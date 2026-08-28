@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from protocol import StreamEvent, crc16_modbus
+from protocol import IpdFrame, StreamEvent, crc16_modbus
 
 try:
     import tkinter  # noqa: F401
@@ -18,7 +18,12 @@ except ModuleNotFoundError:
     tkinter_stub.ttk = types.SimpleNamespace()
     sys.modules["tkinter"] = tkinter_stub
 
-from yed_ipd_tool import TestConfig, TestRunner, application_directory
+from yed_ipd_tool import (
+    TestConfig,
+    TestFailure,
+    TestRunner,
+    application_directory,
+)
 
 
 def make_runner():
@@ -38,6 +43,39 @@ def make_runner():
 
 
 class RunnerTests(unittest.TestCase):
+    def test_ack_timeout_is_retried(self):
+        class FakeAt:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+        runner = make_runner()
+        runner.at = FakeAt()
+        frame = IpdFrame(
+            link_id=0,
+            frame_id=89,
+            payload=b"data",
+            received_crc=0,
+            expected_crc=0,
+        )
+        with patch.object(
+            runner,
+            "_wait_for",
+            side_effect=[TestFailure("timeout"), b"OK"],
+        ), patch("yed_ipd_tool.time.sleep"):
+            runner._ack_frame(frame)
+        self.assertEqual(
+            runner.at.writes,
+            [b"AT+IPDACK=89\r\n", b"AT+IPDACK=89\r\n"],
+        )
+        self.assertEqual(runner.stats.links[0].ack_ok, 1)
+        self.assertEqual(runner.stats.links[0].ack_command_retries, 1)
+
     def test_frozen_app_uses_executable_directory(self):
         executable = str(Path(tempfile.gettempdir()) / "tool" / "YED_IPD_Test.exe")
         with patch.object(sys, "frozen", True, create=True), patch.object(
