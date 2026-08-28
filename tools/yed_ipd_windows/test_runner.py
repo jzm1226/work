@@ -26,7 +26,7 @@ from yed_ipd_tool import (
 )
 
 
-def make_runner():
+def make_runner(fault_interval=0):
     config = TestConfig(
         at_port="COM1",
         cli_port="",
@@ -37,12 +37,110 @@ def make_runner():
         duration_minutes=30,
         ack_timeout_ms=5000,
         retry_count=3,
+        fault_interval=fault_interval,
         output_root=tempfile.gettempdir(),
     )
     return TestRunner(config, threading.Event(), lambda _kind, _payload: None)
 
 
 class RunnerTests(unittest.TestCase):
+    @staticmethod
+    def _frame(frame_id, link_id=0, payload=b"data"):
+        return IpdFrame(
+            link_id=link_id,
+            frame_id=frame_id,
+            payload=payload,
+            received_crc=0,
+            expected_crc=0,
+        )
+
+    def test_fault_modes_alternate_by_global_unique_frame_count(self):
+        runner = make_runner(fault_interval=2)
+        for frame_id in range(1, 5):
+            runner._accept_frame(self._frame(frame_id, link_id=frame_id % 2))
+        self.assertEqual(
+            runner.planned_fault_modes,
+            {2: "explicit", 4: "timeout"},
+        )
+
+    def test_explicit_fault_accepts_matching_retransmission(self):
+        runner = make_runner(fault_interval=1)
+        original = self._frame(100, link_id=1, payload=b"payload")
+        runner._accept_frame(original)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_command", return_value=True) as command:
+            runner._process_frame(original)
+        command.assert_called_once_with(
+            "AT+IPDRETRY=100", timeout=2.0, display=False
+        )
+        self.assertEqual(runner.fault_pending[100].mode, "explicit")
+
+        runner._accept_frame(original)
+        retransmission = runner.pending_frames.popleft()
+        with patch.object(runner, "_echo_frame") as echo:
+            runner._process_frame(retransmission)
+        echo.assert_called_once_with(original)
+        self.assertNotIn(100, runner.fault_pending)
+        self.assertEqual(runner.stats.fault_explicit_completed, 1)
+        self.assertEqual(
+            runner.stats.links[1].intentional_retransmissions, 1
+        )
+
+    def test_fault_completes_only_after_ack_and_echo_succeed(self):
+        runner = make_runner(fault_interval=1)
+        frame = self._frame(100, link_id=1, payload=b"payload")
+        runner._accept_frame(frame)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_command", return_value=True):
+            runner._process_frame(frame)
+        runner._accept_frame(frame)
+        retransmission = runner.pending_frames.popleft()
+
+        with patch.object(
+            runner, "_echo_frame", side_effect=TestFailure("echo failed")
+        ):
+            with self.assertRaisesRegex(TestFailure, "echo failed"):
+                runner._process_frame(retransmission)
+
+        self.assertIn(100, runner.fault_pending)
+        self.assertEqual(runner.stats.fault_explicit_completed, 0)
+
+    def test_fault_retransmission_must_match_link_and_payload(self):
+        runner = make_runner(fault_interval=1)
+        original = self._frame(100, link_id=0, payload=b"original")
+        runner._accept_frame(original)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_command", return_value=True):
+            runner._process_frame(original)
+
+        with self.assertRaisesRegex(
+            TestFailure, "Retransmission changed link or payload"
+        ):
+            runner._accept_frame(
+                self._frame(100, link_id=1, payload=b"changed")
+            )
+
+    def test_timeout_fault_sends_no_command(self):
+        runner = make_runner(fault_interval=1)
+        first = self._frame(100)
+        second = self._frame(101)
+        runner._accept_frame(first)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_command", return_value=True):
+            runner._process_frame(first)
+        runner._accept_frame(first)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_echo_frame"):
+            runner._process_frame(first)
+
+        runner._accept_frame(second)
+        runner.pending_frames.popleft()
+        with patch.object(runner, "_command") as command:
+            runner._process_frame(second)
+        command.assert_not_called()
+        self.assertEqual(runner.fault_pending[101].mode, "timeout")
+        self.assertEqual(runner.stats.fault_timeout_withheld, 1)
+
     def test_ack_timeout_is_retried(self):
         class FakeAt:
             def __init__(self):
@@ -56,13 +154,7 @@ class RunnerTests(unittest.TestCase):
 
         runner = make_runner()
         runner.at = FakeAt()
-        frame = IpdFrame(
-            link_id=0,
-            frame_id=89,
-            payload=b"data",
-            received_crc=0,
-            expected_crc=0,
-        )
+        frame = self._frame(89)
         with patch.object(
             runner,
             "_wait_for",
@@ -107,6 +199,15 @@ class RunnerTests(unittest.TestCase):
         runner.stats.links[1].unique_frames = 10
         runner._complete_result()
         self.assertEqual(runner.stats.result, "PASS")
+
+    def test_completion_fails_for_scheduled_fault_not_processed(self):
+        runner = make_runner(fault_interval=1)
+        runner.stats.links[0].unique_frames = 1
+        runner.stats.links[1].unique_frames = 1
+        runner.planned_fault_modes[100] = "explicit"
+        runner._complete_result()
+        self.assertEqual(runner.stats.result, "FAIL")
+        self.assertIn("scheduled faults not processed=100", runner.stats.failure_reason)
 
     def test_reversed_at_cli_ports_are_corrected(self):
         class FakePort:
@@ -225,6 +326,7 @@ class RunnerTests(unittest.TestCase):
                 duration_minutes=0.001,
                 ack_timeout_ms=5000,
                 retry_count=3,
+                fault_interval=0,
                 output_root=output_root,
             )
             notifications = []

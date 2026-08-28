@@ -24,7 +24,7 @@ from protocol import AtStreamParser, IpdFrame, StreamEvent
 
 
 APP_NAME = "YED IPD TCP Server Test"
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 SOFTAP_IP = "192.168.4.1"
 SOFTAP_MASK = "255.255.255.0"
 SERVER_PORT = 4000
@@ -49,6 +49,7 @@ class TestConfig:
     duration_minutes: float
     ack_timeout_ms: int
     retry_count: int
+    fault_interval: int
     output_root: str
 
 
@@ -58,6 +59,7 @@ class LinkStats:
     frames: int = 0
     unique_frames: int = 0
     duplicate_frames: int = 0
+    intentional_retransmissions: int = 0
     bytes_received: int = 0
     ack_ok: int = 0
     ack_command_retries: int = 0
@@ -76,7 +78,12 @@ class TestStats:
         default_factory=lambda: [LinkStats() for _ in range(MAX_LINKS)]
     )
     retry_logs: int = 0
+    manual_retry_logs: int = 0
     drop_logs: int = 0
+    fault_explicit_requested: int = 0
+    fault_timeout_withheld: int = 0
+    fault_explicit_completed: int = 0
+    fault_timeout_completed: int = 0
     at_errors: int = 0
     parse_errors: int = 0
     started_at: str = ""
@@ -88,6 +95,12 @@ class TestStats:
 
 class TestFailure(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class FaultState:
+    mode: str
+    original: IpdFrame
 
 
 class TestRunner:
@@ -116,6 +129,10 @@ class TestRunner:
         self.queued_frame_ids: Set[int] = set()
         self.processed_ids: Set[int] = set()
         self.processed_order: Deque[int] = deque()
+        self.unique_frame_count = 0
+        self.planned_fault_modes: Dict[int, str] = {}
+        self.fault_pending: Dict[int, FaultState] = {}
+        self.retry_frame_ids: Set[int] = set()
         self.first_data_monotonic: Optional[float] = None
         self.last_snapshot = 0.0
         self.resolved_at_port = config.at_port
@@ -184,6 +201,8 @@ class TestRunner:
             if b"[YED-IPD] timeout retry" in line:
                 self.stats.retry_logs += 1
                 self._emit_log("CLI retry: " + line.decode("utf-8", "replace").strip())
+            elif b"[YED-IPD] manual retry" in line:
+                self.stats.manual_retry_logs += 1
             elif b"[YED-IPD] timeout drop" in line:
                 self.stats.drop_logs += 1
                 self._emit_log("CLI drop: " + line.decode("utf-8", "replace").strip())
@@ -224,6 +243,34 @@ class TestRunner:
                 f"received={frame.received_crc:04X}, expected={frame.expected_crc:04X}"
             )
 
+        fault = self.fault_pending.get(frame.frame_id)
+        if fault is not None:
+            if (
+                frame.link_id != fault.original.link_id
+                or frame.payload != fault.original.payload
+            ):
+                raise TestFailure(
+                    f"Retransmission changed link or payload frame={frame.frame_id}"
+                )
+            if frame.frame_id in self.queued_frame_ids:
+                link.duplicate_frames += 1
+                self._emit_log(
+                    f"extra retransmission while queued link={frame.link_id} "
+                    f"frame={frame.frame_id}"
+                )
+                return
+            link.duplicate_frames += 1
+            link.intentional_retransmissions += 1
+            self.retry_frame_ids.add(frame.frame_id)
+            self.queued_frame_ids.add(frame.frame_id)
+            self.pending_frames.append(frame)
+            self._emit_log(
+                f"expected retransmission received mode={fault.mode} "
+                f"link={frame.link_id} frame={frame.frame_id} "
+                f"len={len(frame.payload)}"
+            )
+            return
+
         if frame.frame_id in self.queued_frame_ids or frame.frame_id in self.processed_ids:
             link.duplicate_frames += 1
             self._emit_log(
@@ -239,6 +286,18 @@ class TestRunner:
             self._emit_log("First TCP data received; duration timer started")
 
         link.unique_frames += 1
+        self.unique_frame_count += 1
+        if (
+            self.config.fault_interval > 0
+            and self.unique_frame_count % self.config.fault_interval == 0
+        ):
+            fault_number = self.unique_frame_count // self.config.fault_interval
+            mode = "explicit" if fault_number % 2 == 1 else "timeout"
+            self.planned_fault_modes[frame.frame_id] = mode
+            self._emit_log(
+                f"fault scheduled count={self.unique_frame_count} mode={mode} "
+                f"link={frame.link_id} frame={frame.frame_id}"
+            )
         self.queued_frame_ids.add(frame.frame_id)
         self.pending_frames.append(frame)
         self._emit_log(
@@ -328,6 +387,43 @@ class TestRunner:
         while len(self.processed_order) > 8192:
             old_id = self.processed_order.popleft()
             self.processed_ids.discard(old_id)
+
+    def _process_frame(self, frame: IpdFrame) -> None:
+        if frame.frame_id in self.retry_frame_ids:
+            fault = self.fault_pending[frame.frame_id]
+            self._echo_frame(frame)
+            self.retry_frame_ids.discard(frame.frame_id)
+            self.fault_pending.pop(frame.frame_id)
+            self.stats.fault_explicit_completed += int(fault.mode == "explicit")
+            self.stats.fault_timeout_completed += int(fault.mode == "timeout")
+            self._emit_log(
+                f"fault completed mode={fault.mode} link={frame.link_id} "
+                f"frame={frame.frame_id}"
+            )
+            return
+
+        mode = self.planned_fault_modes.pop(frame.frame_id, None)
+        if mode is None:
+            self._echo_frame(frame)
+            return
+
+        self.queued_frame_ids.discard(frame.frame_id)
+        self.fault_pending[frame.frame_id] = FaultState(mode, frame)
+        if mode == "explicit":
+            self.stats.fault_explicit_requested += 1
+            self._emit_log(
+                f"requesting retransmission link={frame.link_id} "
+                f"frame={frame.frame_id}"
+            )
+            self._command(
+                f"AT+IPDRETRY={frame.frame_id}", timeout=2.0, display=False
+            )
+        else:
+            self.stats.fault_timeout_withheld += 1
+            self._emit_log(
+                f"withholding ACK/RETRY; waiting for device timeout "
+                f"link={frame.link_id} frame={frame.frame_id}"
+            )
 
     def _ack_frame(self, frame: IpdFrame) -> None:
         link = self.stats.links[frame.link_id]
@@ -552,13 +648,32 @@ class TestRunner:
                 f"data received on only {active_data_links} link(s); "
                 f"at least {MIN_TEST_LINKS} required"
             )
-        if self.stats.retry_logs:
-            anomalies.append(f"CLI retries={self.stats.retry_logs}")
+        unexpected_retry_logs = max(
+            0, self.stats.retry_logs - self.stats.fault_timeout_completed
+        )
+        if unexpected_retry_logs:
+            anomalies.append(f"unexpected CLI retries={unexpected_retry_logs}")
         if self.stats.drop_logs:
             anomalies.append(f"CLI drops={self.stats.drop_logs}")
+        if self.fault_pending:
+            anomalies.append(
+                "fault retransmissions pending="
+                + ",".join(str(frame_id) for frame_id in self.fault_pending)
+            )
+        if self.planned_fault_modes:
+            anomalies.append(
+                "scheduled faults not processed="
+                + ",".join(str(frame_id) for frame_id in self.planned_fault_modes)
+            )
         for link_id, link in enumerate(self.stats.links):
-            if link.duplicate_frames:
-                anomalies.append(f"link{link_id} duplicate frames={link.duplicate_frames}")
+            unexpected_duplicates = (
+                link.duplicate_frames - link.intentional_retransmissions
+            )
+            if unexpected_duplicates:
+                anomalies.append(
+                    f"link{link_id} unexpected duplicate frames="
+                    f"{unexpected_duplicates}"
+                )
             if link.crc_errors:
                 anomalies.append(f"link{link_id} CRC errors={link.crc_errors}")
             if link.send_fail:
@@ -593,7 +708,13 @@ class TestRunner:
             f"RESOLVED_AT_PORT: {self.resolved_at_port}",
             f"RESOLVED_CLI_PORT: {self.resolved_cli_port or 'disabled'}",
             f"MIN_DATA_LINKS: {MIN_TEST_LINKS}",
+            f"FAULT_INTERVAL: {self.config.fault_interval}",
+            f"FAULT_EXPLICIT_REQUESTED: {self.stats.fault_explicit_requested}",
+            f"FAULT_TIMEOUT_WITHHELD: {self.stats.fault_timeout_withheld}",
+            f"FAULT_EXPLICIT_COMPLETED: {self.stats.fault_explicit_completed}",
+            f"FAULT_TIMEOUT_COMPLETED: {self.stats.fault_timeout_completed}",
             f"CLI_RETRY_LOGS: {self.stats.retry_logs}",
+            f"CLI_MANUAL_RETRY_LOGS: {self.stats.manual_retry_logs}",
             f"CLI_DROP_LOGS: {self.stats.drop_logs}",
             f"AT_ERRORS: {self.stats.at_errors}",
             f"PARSE_ERRORS: {self.stats.parse_errors}",
@@ -602,6 +723,7 @@ class TestRunner:
             lines.append(
                 f"LINK{link_id}: frames={link.frames} unique={link.unique_frames} "
                 f"duplicates={link.duplicate_frames} bytes_rx={link.bytes_received} "
+                f"intentional_retransmissions={link.intentional_retransmissions} "
                 f"ack_ok={link.ack_ok} ack_retries={link.ack_command_retries} "
                 f"ack_response_lost={link.ack_response_lost} "
                 f"echoed={link.echoed_frames} "
@@ -662,7 +784,7 @@ class TestRunner:
 
                 if self.pending_frames:
                     frame = self.pending_frames.popleft()
-                    self._echo_frame(frame)
+                    self._process_frame(frame)
 
                 # A response read can also contain a following +IPD frame.
                 while self.serial_events:
@@ -744,6 +866,7 @@ class TestApp(tk.Tk):
         self.password = tk.StringVar(value="12345678")
         self.channel = tk.StringVar(value="6")
         self.duration = tk.StringVar(value="30")
+        self.fault_interval = tk.StringVar(value="100")
         self.output_root = tk.StringVar(value=str(application_directory()))
 
         ttk.Label(settings, text="SoftAP SSID").grid(row=0, column=0, sticky="w")
@@ -775,11 +898,20 @@ class TestApp(tk.Tk):
         ttk.Label(settings, text=f"{SOFTAP_IP}:{SERVER_PORT} (TCP)").grid(
             row=1, column=3, sticky="w", padx=(8, 18), pady=(10, 0)
         )
+        ttk.Label(settings, text="Fault interval (frames)").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Entry(settings, textvariable=self.fault_interval).grid(
+            row=2, column=1, sticky="ew", padx=(8, 18), pady=(10, 0)
+        )
         ttk.Label(settings, text="Output folder").grid(
-            row=1, column=4, sticky="w", pady=(10, 0)
+            row=2, column=2, sticky="w", pady=(10, 0)
         )
         output_frame = ttk.Frame(settings)
-        output_frame.grid(row=1, column=5, sticky="ew", padx=(8, 0), pady=(10, 0))
+        output_frame.grid(
+            row=2, column=3, columnspan=3, sticky="ew",
+            padx=(8, 0), pady=(10, 0)
+        )
         output_frame.columnconfigure(0, weight=1)
         ttk.Entry(output_frame, textvariable=self.output_root).grid(
             row=0, column=0, sticky="ew"
@@ -896,6 +1028,11 @@ class TestApp(tk.Tk):
         duration = float(self.duration.get())
         if duration <= 0 or duration > 24 * 60:
             raise ValueError("Duration must be between 0 and 1440 minutes")
+        fault_interval = int(self.fault_interval.get())
+        if fault_interval < 0 or fault_interval > 1000000:
+            raise ValueError(
+                "Fault interval must be between 0 and 1000000 frames"
+            )
         output_root = Path(self.output_root.get()).expanduser()
         output_root.mkdir(parents=True, exist_ok=True)
         return TestConfig(
@@ -908,6 +1045,7 @@ class TestApp(tk.Tk):
             duration_minutes=duration,
             ack_timeout_ms=5000,
             retry_count=3,
+            fault_interval=fault_interval,
             output_root=str(output_root),
         )
 
@@ -988,6 +1126,8 @@ class TestApp(tk.Tk):
             text=(
                 f"Elapsed: {payload.get('elapsed_seconds', 0):.1f}s    "
                 f"Retry: {payload.get('retry_logs', 0)}    "
+                f"Fault replay: "
+                f"{payload.get('fault_explicit_completed', 0) + payload.get('fault_timeout_completed', 0)}    "
                 f"Drop: {payload.get('drop_logs', 0)}    "
                 f"AT errors: {payload.get('at_errors', 0)}"
             )
