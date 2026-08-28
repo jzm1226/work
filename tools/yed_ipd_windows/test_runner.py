@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from protocol import StreamEvent, crc16_modbus
 
@@ -17,7 +18,7 @@ except ModuleNotFoundError:
     tkinter_stub.ttk = types.SimpleNamespace()
     sys.modules["tkinter"] = tkinter_stub
 
-from yed_ipd_tool import TestConfig, TestRunner
+from yed_ipd_tool import TestConfig, TestRunner, application_directory
 
 
 def make_runner():
@@ -37,6 +38,13 @@ def make_runner():
 
 
 class RunnerTests(unittest.TestCase):
+    def test_frozen_app_uses_executable_directory(self):
+        executable = str(Path(tempfile.gettempdir()) / "tool" / "YED_IPD_Test.exe")
+        with patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "executable", executable
+        ):
+            self.assertEqual(application_directory(), Path(executable).parent)
+
     def test_wait_keeps_events_after_matching_response(self):
         runner = make_runner()
         runner.serial_events.extend(
@@ -59,6 +67,52 @@ class RunnerTests(unittest.TestCase):
         runner.stats.links[1].unique_frames = 10
         runner._complete_result()
         self.assertEqual(runner.stats.result, "PASS")
+
+    def test_reversed_at_cli_ports_are_corrected(self):
+        class FakePort:
+            def reset_input_buffer(self):
+                pass
+
+        runner = make_runner()
+        configured_at = FakePort()
+        configured_cli = FakePort()
+        runner.at = configured_at
+        runner.cli = configured_cli
+        runner.resolved_at_port = "COM3"
+        runner.resolved_cli_port = "COM4"
+        with patch.object(runner, "_probe_at", side_effect=[False, True]):
+            runner._detect_port_roles()
+        self.assertIs(runner.at, configured_cli)
+        self.assertIs(runner.cli, configured_at)
+        self.assertEqual(runner.resolved_at_port, "COM4")
+        self.assertEqual(runner.resolved_cli_port, "COM3")
+
+    def test_cli_debug_is_verified(self):
+        class FakeCli:
+            def __init__(self):
+                self.incoming = bytearray()
+
+            @property
+            def in_waiting(self):
+                return len(self.incoming)
+
+            def write(self, data):
+                self.asserted_wire = data
+                self.incoming.extend(b"YED IPD debug: 1\r\nOK\r\n")
+
+            def flush(self):
+                pass
+
+            def read(self, size):
+                data = bytes(self.incoming[:size])
+                del self.incoming[:size]
+                return data
+
+        runner = make_runner()
+        runner.cli = FakeCli()
+        runner.resolved_cli_port = "COM4"
+        runner._enable_cli_debug()
+        self.assertEqual(runner.cli.asserted_wire, b"yed_ipd_debug 1\r\n")
 
     def test_full_two_link_ack_and_echo_flow(self):
         class FakeSerial:

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -23,12 +24,18 @@ from protocol import AtStreamParser, IpdFrame, StreamEvent
 
 
 APP_NAME = "YED IPD TCP Server Test"
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 SOFTAP_IP = "192.168.4.1"
 SOFTAP_MASK = "255.255.255.0"
 SERVER_PORT = 4000
 MAX_LINKS = 5
 MIN_TEST_LINKS = 2
+
+
+def application_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,8 @@ class TestRunner:
         self.processed_order: Deque[int] = deque()
         self.first_data_monotonic: Optional[float] = None
         self.last_snapshot = 0.0
+        self.resolved_at_port = config.at_port
+        self.resolved_cli_port = config.cli_port
 
     def _emit_log(self, message: str, display: bool = True) -> None:
         stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -336,30 +345,136 @@ class TestRunner:
         self.notify("output_dir", str(self.output_dir))
 
     def _open_ports(self) -> None:
-        self.at = serial.Serial(
-            self.config.at_port,
-            self.config.baudrate,
-            timeout=0.02,
-            write_timeout=2.0,
-        )
-        self.at.reset_input_buffer()
-        self.at.reset_output_buffer()
+        # Open CLI first because some dual-UART adapters toggle shared control
+        # lines when their second COM port is opened.
         if self.config.cli_port:
             self.cli = serial.Serial(
                 self.config.cli_port,
                 self.config.baudrate,
                 timeout=0.01,
                 write_timeout=2.0,
+                rtscts=False,
+                dsrdtr=False,
             )
+            self._deassert_control_lines(self.cli, "CLI")
             self.cli.reset_input_buffer()
             self.cli.reset_output_buffer()
-            self.cli.write(b"yed_ipd_debug 1\r\n")
-            self.cli.flush()
-            self._emit_log("CLI debug enabled")
+
+        self.at = serial.Serial(
+            self.config.at_port,
+            self.config.baudrate,
+            timeout=0.02,
+            write_timeout=2.0,
+            rtscts=False,
+            dsrdtr=False,
+        )
+        self._deassert_control_lines(self.at, "AT")
+        self.at.reset_input_buffer()
+        self.at.reset_output_buffer()
+        self._emit_log(
+            f"Serial ports opened: AT={self.config.at_port}, "
+            f"CLI={self.config.cli_port or 'disabled'}"
+        )
+
+    def _deassert_control_lines(self, port: serial.Serial, role: str) -> None:
+        try:
+            port.dtr = False
+            port.rts = False
+        except (OSError, serial.SerialException) as exc:
+            self._emit_log(f"{role} DTR/RTS control unavailable: {exc}")
+
+    def _reset_at_parser(self) -> None:
+        self.parser = AtStreamParser()
+        self.serial_events.clear()
+        if self.at is not None:
+            self.at.reset_input_buffer()
+
+    def _probe_at(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            attempt += 1
+            self._write_command("AT")
+            try:
+                if self._wait_for("ok", 1.0, fail_on_error=False) == b"OK":
+                    self._emit_log(
+                        f"AT handshake OK on {self.resolved_at_port} "
+                        f"(attempt {attempt})"
+                    )
+                    return True
+            except TestFailure:
+                pass
+            time.sleep(0.25)
+        return False
+
+    def _detect_port_roles(self) -> None:
+        # Allow enough time for a possible board reset caused by opening COM.
+        if self._probe_at(6.0):
+            return
+
+        if self.cli is None:
+            raise TestFailure(
+                f"No AT response on {self.resolved_at_port}. Check the AT COM "
+                "selection, close other serial tools, and reset the board."
+            )
+
+        self._emit_log(
+            f"No AT response on {self.resolved_at_port}; checking whether AT/CLI "
+            "ports are reversed"
+        )
+        self.at, self.cli = self.cli, self.at
+        self.resolved_at_port, self.resolved_cli_port = (
+            self.resolved_cli_port,
+            self.resolved_at_port,
+        )
+        self._reset_at_parser()
+        if self._probe_at(3.0):
+            self._emit_log(
+                f"AT/CLI ports were reversed and have been corrected: "
+                f"AT={self.resolved_at_port}, CLI={self.resolved_cli_port}"
+            )
+            return
+
+        raise TestFailure(
+            f"No AT response on either selected port "
+            f"({self.config.at_port}, {self.config.cli_port}). Check the COM "
+            "selections, close other serial tools, and reset the board."
+        )
+
+    def _enable_cli_debug(self) -> None:
+        if self.cli is None:
+            return
+        wire = b"yed_ipd_debug 1\r\n"
+        self.cli.write(wire)
+        self.cli.flush()
+        self._emit_log(f"CLI debug command sent on {self.resolved_cli_port}")
+        response = bytearray()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            waiting = self.cli.in_waiting
+            chunk = self.cli.read(max(waiting, 1))
+            if chunk:
+                stamp = datetime.now().isoformat(timespec="milliseconds")
+                if self.cli_log is not None:
+                    self.cli_log.write(f"[{stamp}] ".encode("ascii") + chunk)
+                    self.cli_log.flush()
+                response.extend(chunk)
+                self._scan_cli(chunk)
+                if re.search(rb"(?:^|[\r\n])OK(?:[\r\n]|$)", response):
+                    self._emit_log(
+                        f"CLI debug enabled and verified on {self.resolved_cli_port}"
+                    )
+                    return
+            time.sleep(0.005)
+        raise TestFailure(
+            f"No CLI OK response on {self.resolved_cli_port}. Check the CLI COM "
+            "selection and close other serial tools."
+        )
 
     def _setup_board(self) -> None:
         self.notify("state", "CONFIGURING")
-        self._command("AT", timeout=2.0)
+        self._detect_port_roles()
+        self._enable_cli_debug()
         self._command("AT+CIPSERVER=0,1", timeout=2.0, allow_error=True)
         self._command("AT+CWMODE=2", timeout=5.0)
         self._command(
@@ -430,6 +545,8 @@ class TestRunner:
             f"ELAPSED_SECONDS: {self.stats.elapsed_seconds:.3f}",
             f"SOFTAP: {self.config.ssid} ({SOFTAP_IP})",
             f"TCP_SERVER_PORT: {SERVER_PORT}",
+            f"RESOLVED_AT_PORT: {self.resolved_at_port}",
+            f"RESOLVED_CLI_PORT: {self.resolved_cli_port or 'disabled'}",
             f"MIN_DATA_LINKS: {MIN_TEST_LINKS}",
             f"CLI_RETRY_LOGS: {self.stats.retry_logs}",
             f"CLI_DROP_LOGS: {self.stats.drop_logs}",
@@ -580,7 +697,7 @@ class TestApp(tk.Tk):
         self.password = tk.StringVar(value="12345678")
         self.channel = tk.StringVar(value="6")
         self.duration = tk.StringVar(value="30")
-        self.output_root = tk.StringVar(value=str(Path.home() / "Documents"))
+        self.output_root = tk.StringVar(value=str(application_directory()))
 
         ttk.Label(settings, text="SoftAP SSID").grid(row=0, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.ssid).grid(
