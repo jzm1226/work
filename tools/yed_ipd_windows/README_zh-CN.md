@@ -29,7 +29,7 @@
 ## 使用 EXE
 
 1. 连接开发板 AT 串口；需要固件诊断日志时再连接 CLI 串口。
-2. 运行 `YED_IPD_Test.exe`。
+2. 运行 `YED_IPD_Test_YYYYMMDD_HHMMSS.exe`。
 3. 选择 AT port 和可选的 CLI port。
 4. 设置 SSID、密码、信道和测试时长，点击 `Start`。
 5. TCP Client 连接上述 SoftAP 和 Server，发送数据并校验回包与发送内容相同。
@@ -43,7 +43,7 @@ CLI port 被选择时，工具启动后自动执行 `yed_ipd_debug 1`，退出�
 
 每次运行创建独立的 `YED_IPD_YYYYMMDD_HHMMSS` 目录：
 
-默认在 `YED_IPD_Test.exe` 所在目录中创建测试目录，也可以在启动测试前通过 `Browse` 修改输出位置。
+默认在 `YED_IPD_Test_YYYYMMDD_HHMMSS.exe` 所在目录中创建测试目录，也可以在启动测试前通过 `Browse` 修改输出位置。
 
 - `summary.txt`：客户可直接查看的最终结论和各 link 统计。
 - `summary.json`：结构化统计。
@@ -59,7 +59,9 @@ CLI port 被选择时，工具启动后自动执行 `yed_ipd_debug 1`，退出�
 安装 Python 3.10 或更新版本后，双击 `build_windows.bat`。脚本将在 Windows 本机生成：
 
 ```text
-dist\YED_IPD_Test.exe
+dist\YED_IPD_Test_YYYYMMDD_HHMMSS.exe
 ```
+
+文件名后缀是构建时间，例如 `YED_IPD_Test_20260828_103015.exe`。
 
 也可以双击 `run_windows.bat` 直接以 Python 方式启动。

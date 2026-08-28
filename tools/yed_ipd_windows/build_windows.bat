@@ -21,11 +21,17 @@ if errorlevel 1 exit /b 1
 python -m pip install -r requirements-build.txt
 if errorlevel 1 exit /b 1
 
+for /f %%I in ('powershell.exe -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "BUILD_TIMESTAMP=%%I"
+if not defined BUILD_TIMESTAMP (
+    echo Failed to generate build timestamp.
+    exit /b 1
+)
+
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-    --name YED_IPD_Test ^
+    --name YED_IPD_Test_%BUILD_TIMESTAMP% ^
     yed_ipd_tool.py
 if errorlevel 1 exit /b 1
 
 echo.
-echo Build complete: dist\YED_IPD_Test.exe
+echo Build complete: dist\YED_IPD_Test_%BUILD_TIMESTAMP%.exe
 endlocal

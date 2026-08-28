@@ -31,14 +31,23 @@ jobs:
         working-directory: tools/yed_ipd_windows
         run: python -m unittest -v
 
+      - name: Generate build timestamp
+        shell: pwsh
+        run: |
+          "BUILD_TIMESTAMP=$(Get-Date -Format 'yyyyMMdd_HHmmss')" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Build Windows EXE
         working-directory: tools/yed_ipd_windows
+        shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name YED_IPD_Test yed_ipd_tool.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name "YED_IPD_Test_$env:BUILD_TIMESTAMP" yed_ipd_tool.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: YED_IPD_Test_Windows
-          path: tools/yed_ipd_windows/dist/YED_IPD_Test.exe
+          name: YED_IPD_Test_Windows_${{ env.BUILD_TIMESTAMP }}
+          path: tools/yed_ipd_windows/dist/YED_IPD_Test_*.exe
+          if-no-files-found: error
           retention-days: 7
