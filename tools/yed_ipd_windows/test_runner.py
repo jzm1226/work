@@ -43,7 +43,9 @@ class RunnerTests(unittest.TestCase):
         with patch.object(sys, "frozen", True, create=True), patch.object(
             sys, "executable", executable
         ):
-            self.assertEqual(application_directory(), Path(executable).parent)
+            self.assertEqual(
+                application_directory(), Path(executable).resolve().parent
+            )
 
     def test_wait_keeps_events_after_matching_response(self):
         runner = make_runner()
