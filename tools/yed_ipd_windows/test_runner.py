@@ -89,7 +89,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.resolved_at_port, "COM4")
         self.assertEqual(runner.resolved_cli_port, "COM3")
 
-    def test_cli_debug_is_verified(self):
+    def test_cli_debug_does_not_require_response(self):
         class FakeCli:
             def __init__(self):
                 self.incoming = bytearray()
@@ -100,7 +100,6 @@ class RunnerTests(unittest.TestCase):
 
             def write(self, data):
                 self.asserted_wire = data
-                self.incoming.extend(b"YED IPD debug: 1\r\nOK\r\n")
 
             def flush(self):
                 pass

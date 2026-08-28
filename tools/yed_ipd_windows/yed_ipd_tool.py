@@ -24,7 +24,7 @@ from protocol import AtStreamParser, IpdFrame, StreamEvent
 
 
 APP_NAME = "YED IPD TCP Server Test"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 SOFTAP_IP = "192.168.4.1"
 SOFTAP_MASK = "255.255.255.0"
 SERVER_PORT = 4000
@@ -166,9 +166,8 @@ class TestRunner:
             waiting = self.cli.in_waiting
             chunk = self.cli.read(max(waiting, 1))
             if chunk:
-                stamp = datetime.now().isoformat(timespec="milliseconds")
                 if self.cli_log is not None:
-                    self.cli_log.write(f"[{stamp}] ".encode("ascii") + chunk)
+                    self.cli_log.write(chunk)
                     self.cli_log.flush()
                 self._scan_cli(chunk)
         self.serial_events.extend(events)
@@ -447,29 +446,12 @@ class TestRunner:
         wire = b"yed_ipd_debug 1\r\n"
         self.cli.write(wire)
         self.cli.flush()
-        self._emit_log(f"CLI debug command sent on {self.resolved_cli_port}")
-        response = bytearray()
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            waiting = self.cli.in_waiting
-            chunk = self.cli.read(max(waiting, 1))
-            if chunk:
-                stamp = datetime.now().isoformat(timespec="milliseconds")
-                if self.cli_log is not None:
-                    self.cli_log.write(f"[{stamp}] ".encode("ascii") + chunk)
-                    self.cli_log.flush()
-                response.extend(chunk)
-                self._scan_cli(chunk)
-                if re.search(rb"(?:^|[\r\n])OK(?:[\r\n]|$)", response):
-                    self._emit_log(
-                        f"CLI debug enabled and verified on {self.resolved_cli_port}"
-                    )
-                    return
-            time.sleep(0.005)
-        raise TestFailure(
-            f"No CLI OK response on {self.resolved_cli_port}. Check the CLI COM "
-            "selection and close other serial tools."
+        self._emit_log(
+            f"CLI debug command sent on {self.resolved_cli_port}; "
+            "response is not required"
         )
+        time.sleep(0.15)
+        self._read_serial()
 
     def _setup_board(self) -> None:
         self.notify("state", "CONFIGURING")
